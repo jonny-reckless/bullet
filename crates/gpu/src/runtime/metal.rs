@@ -10,10 +10,11 @@ use objc2::AllocAnyThread;
 use objc2::ffi::NSUInteger;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication};
 
@@ -129,7 +130,15 @@ impl GpuBindings for Metal {
         Ok(())
     }
 
+    /// Metal has no device-wide barrier, so synchronising the "context"
+    /// means waiting on every command queue created on it.
     unsafe fn context_sync() -> MetalResult {
+        let streams: Vec<u64> = QUEUE_REGISTRY.with_borrow(|r| r.keys().copied().collect());
+
+        for stream in streams {
+            Self::stream_sync(stream)?;
+        }
+
         Ok(())
     }
 
@@ -220,15 +229,61 @@ impl GpuBindings for Metal {
         Self::context_free(dev_ptr)
     }
 
-    unsafe fn stream_memset(_stream: u64, dev_ptr: u64, bytes: usize, value: u8) -> MetalResult {
-        Self::context_memset(dev_ptr, bytes, value)
+    /// Queued on the stream with a blit encoder, so that it is ordered against
+    /// kernels already committed to the same queue.
+    ///
+    /// Writing `contents()` from the host instead would not be ordered against
+    /// them, and would race with any in-flight kernel reading or accumulating
+    /// into the same buffer.
+    unsafe fn stream_memset(stream: u64, dev_ptr: u64, bytes: usize, value: u8) -> MetalResult {
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        autoreleasepool(|_| {
+            let command_buffer = QUEUE_REGISTRY.with_borrow(|r| {
+                let queue = r.get(&stream).ok_or_else(|| MetalError::Runtime("Stream not found".into()))?;
+                queue.commandBuffer().ok_or_else(|| MetalError::Runtime("Failed to create command buffer".into()))
+            })?;
+
+            let encoder = command_buffer
+                .blitCommandEncoder()
+                .ok_or_else(|| MetalError::Runtime("Failed to create blit encoder".into()))?;
+
+            BUFFER_REGISTRY.with_borrow(|r| {
+                let buffer =
+                    r.get(&dev_ptr).ok_or_else(|| MetalError::Runtime(format!("Buffer {dev_ptr} not found")))?;
+
+                if bytes > buffer.length() as usize {
+                    return Err(MetalError::Runtime(format!(
+                        "Memset of {bytes} bytes exceeds buffer {dev_ptr} length {}",
+                        buffer.length()
+                    )));
+                }
+
+                encoder.fillBuffer_range_value(buffer, NSRange { location: 0, length: bytes as NSUInteger }, value);
+                Ok(())
+            })?;
+
+            encoder.endEncoding();
+            command_buffer.commit();
+
+            Ok(())
+        })
     }
 
-    unsafe fn stream_memcpy_d2h(_stream: u64, dst: *mut c_void, src: u64, bytes: usize) -> MetalResult {
+    /// On unified memory there is no transfer to perform, only ordering: the
+    /// host copy must not overlap work already committed to this stream. The
+    /// host pointer is not necessarily backed by an `MTLBuffer`, so a blit is
+    /// not available here and the queue has to be drained first.
+    unsafe fn stream_memcpy_d2h(stream: u64, dst: *mut c_void, src: u64, bytes: usize) -> MetalResult {
+        Self::stream_sync(stream)?;
         Self::context_memcpy_d2h(dst, src, bytes)
     }
 
-    unsafe fn stream_memcpy_h2d(_stream: u64, dst: u64, src: *const c_void, bytes: usize) -> MetalResult {
+    /// See `stream_memcpy_d2h`.
+    unsafe fn stream_memcpy_h2d(stream: u64, dst: u64, src: *const c_void, bytes: usize) -> MetalResult {
+        Self::stream_sync(stream)?;
         Self::context_memcpy_h2d(dst, src, bytes)
     }
 
