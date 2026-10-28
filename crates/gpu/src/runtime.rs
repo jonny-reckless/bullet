@@ -575,6 +575,72 @@ mod tests {
         Ok(())
     }
 
+    /// A memset queued on a stream must happen *after* a kernel already queued
+    /// on the same stream, exactly as `cuMemsetD8Async` does.
+    ///
+    /// The kernel writes a non-zero sentinel after a long dependent loop, so it
+    /// is still running when the memset is issued. If the memset is ordered
+    /// behind it, the buffer ends up zeroed. If the memset instead happens
+    /// immediately on the host, the kernel's writes land afterwards and the
+    /// sentinel survives.
+    fn memset_is_ordered_after_queued_kernel<G: Gpu>() -> Result<(), G::Error> {
+        const THREADS: usize = 1 << 22;
+        const BYTES: usize = 4 * THREADS;
+
+        let device = Device::<G>::new(0)?;
+        let stream = device.new_stream()?;
+
+        let kernel_src = match device.dialect() {
+            Dialect::CudaHip => {
+                "extern \"C\" __global__ void slow_sentinel(unsigned int* dst) {
+                    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+                    float acc = 1.0f;
+                    for (int i = 0; i < 4096; i++) { acc = acc * 1.0000001f + 1e-7f; }
+                    dst[tid] = __float_as_uint(acc) | 1u;
+                }"
+            }
+            Dialect::Msl => {
+                "#include <metal_stdlib>
+                using namespace metal;
+                kernel void slow_sentinel(
+                    device uint* dst [[buffer(0)]],
+                    uint tid [[thread_position_in_grid]]
+                ) {
+                    float acc = 1.0;
+                    for (int i = 0; i < 4096; i++) { acc = acc * 1.0000001 + 1e-7; }
+                    dst[tid] = as_type<uint>(acc) | 1u;
+                }"
+            }
+        };
+
+        let kernel = Module::new(device.clone(), kernel_src)?.get_kernel("slow_sentinel")?;
+
+        unsafe {
+            let buf = device.malloc(BYTES)?;
+
+            let gdim = Dim3 { x: (THREADS / 256) as u32, y: 1, z: 1 };
+            let mut args = vec![(&buf) as *const G::DevicePtr as *mut c_void];
+            kernel.launch(&stream, gdim, 256, &mut args, 0)?;
+
+            // No sync here on purpose: this must be ordered by the stream.
+            stream.memset(buf, BYTES, 0)?;
+            stream.sync()?;
+
+            let mut host = vec![0u32; THREADS];
+            device.memcpy_d2h(buf, host.as_mut_ptr().cast(), BYTES)?;
+            device.free(buf)?;
+
+            let survivors = host.iter().filter(|&&x| x != 0).count();
+            assert_eq!(
+                survivors, 0,
+                "{survivors} of {THREADS} words still hold the kernel's sentinel, \
+                 so the memset was not ordered after the kernel"
+            );
+        }
+
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     mod cuda {
         use crate::runtime::cuda::{Cuda, CudaError};
@@ -592,6 +658,11 @@ mod tests {
         #[test]
         fn compile_load_execute_kernel() -> Result<(), CudaError> {
             super::compile_load_execute_kernel::<Cuda>()
+        }
+
+        #[test]
+        fn memset_is_ordered_after_queued_kernel() -> Result<(), CudaError> {
+            super::memset_is_ordered_after_queued_kernel::<Cuda>()
         }
     }
 
@@ -613,6 +684,11 @@ mod tests {
         fn compile_load_execute_kernel() -> Result<(), ROCmError> {
             super::compile_load_execute_kernel::<ROCm>()
         }
+
+        #[test]
+        fn memset_is_ordered_after_queued_kernel() -> Result<(), ROCmError> {
+            super::memset_is_ordered_after_queued_kernel::<ROCm>()
+        }
     }
 
     #[cfg(feature = "metal")]
@@ -632,6 +708,11 @@ mod tests {
         #[test]
         fn compile_load_execute_kernel() -> Result<(), MetalError> {
             super::compile_load_execute_kernel::<Metal>()
+        }
+
+        #[test]
+        fn memset_is_ordered_after_queued_kernel() -> Result<(), MetalError> {
+            super::memset_is_ordered_after_queued_kernel::<Metal>()
         }
     }
 }
